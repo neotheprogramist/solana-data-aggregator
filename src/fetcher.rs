@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use futures::StreamExt;
+use futures::{future::join_all, StreamExt};
 use serde::{Deserialize, Serialize};
 use solana_client::{
     nonblocking::{pubsub_client::PubsubClient, rpc_client::RpcClient},
@@ -94,33 +94,47 @@ impl<C: Connection> TransactionFetcher<C> {
                     match self.rpc.get_block_with_config(adjusted_slot, self.config).await {
                         Ok(block) => {
                             if let Some(signatures) = block.signatures {
+                                let mut fetch_futures = Vec::new();
+
                                 for signature in signatures.into_iter().take(self.tx_limit) {
-                                    match Signature::from_str(&signature) {
-                                        Ok(s) => match self.rpc.get_transaction_with_config(&s, config).await {
-                                            Ok(transaction) => {
-                                                let content = Transaction {
-                                                    signature,
-                                                    slot: adjusted_slot,
-                                                    block_hash: block.blockhash.clone(),
-                                                    timestamp: block.block_time.unwrap_or_default(),
-                                                    data: transaction,
-                                                };
+                                    let rpc = &self.rpc;
+                                    let db = &self.db;
+                                    let config = &config;
+                                    let block_hash = block.blockhash.clone();
+                                    let slot = adjusted_slot;
 
-                                                #[derive(Debug, Deserialize)]
-                                                struct Id {
-                                                    #[allow(dead_code)]
-                                                    id: RecordId,
-                                                }
+                                    fetch_futures.push(async move {
+                                        match Signature::from_str(&signature) {
+                                            Ok(s) => match rpc.get_transaction_with_config(&s, config.clone()).await {
+                                                Ok(transaction) => {
+                                                    let content = Transaction {
+                                                        signature,
+                                                        slot,
+                                                        block_hash,
+                                                        timestamp: block.block_time.unwrap_or_default(),
+                                                        data: transaction,
+                                                    };
 
-                                                match self.db.create::<Option<Id>>("transactions").content(content).await {
-                                                    Ok(id) => info!("Stored transaction: {:?}", id),
-                                                    Err(e) => error!("Failed to store transaction: {}", e),
+                                                    #[derive(Debug, Deserialize)]
+                                                    struct Id {
+                                                        #[allow(dead_code)]
+                                                        id: RecordId,
+                                                    }
+
+                                                    match db.create::<Option<Id>>("transactions").content(content).await {
+                                                        Ok(id) => info!("Stored transaction: {:?}", id),
+                                                        Err(e) => error!("Failed to store transaction: {}", e),
+                                                    }
                                                 }
-                                            }
-                                            Err(e) => error!("Failed to fetch transaction details: {}", e),
-                                        },
-                                        Err(e) => error!("Invalid signature format: {}", e),
-                                    }
+                                                Err(e) => error!("Failed to fetch transaction details: {}", e),
+                                            },
+                                            Err(e) => error!("Invalid signature format: {}", e),
+                                        }
+                                    });
+                                }
+
+                                if !fetch_futures.is_empty() {
+                                    join_all(fetch_futures).await;
                                 }
                             }
                         }
