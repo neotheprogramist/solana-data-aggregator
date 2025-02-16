@@ -1,0 +1,11 @@
+[env]
+RPC_URL = "https://solana-mainnet.g.alchemy.com/v2/XvgEVLBEvtVXMnICSRbmzCgM_dDflaox"
+WS_URL = "wss://mainnet.helius-rpc.com/?api-key=f3708dcc-dafd-4cba-ba74-5b8096686dfa"
+BIND = "0.0.0.0:8080"
+DB_ADDR = "localhost:8000"
+DB_USER = "root"
+DB_PASS = "root"
+DB_NS = "solana"
+DB_DB = "solana"
+ROOT_LAG = "8"
+TX_LIMIT = "4"
