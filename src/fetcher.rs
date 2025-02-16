@@ -14,6 +14,7 @@ use solana_transaction_status_client_types::{
 use surrealdb::{Connection, RecordId, Surreal};
 use thiserror::Error;
 use tokio::{select, sync::broadcast};
+use tracing::{error, info};
 use url::Url;
 
 #[derive(Debug, Error)]
@@ -89,46 +90,57 @@ impl<C: Connection> TransactionFetcher<C> {
         loop {
             select! {
                 Some(slot) = stream.next() => {
-                    let slot = slot - self.root_lag;
-                    let block = self.rpc.get_block_with_config(slot, self.config).await?;
-                    if let Some(signatures) = block.signatures {
-                        for signature in signatures.into_iter().take(self.tx_limit) {
-                            let s = Signature::from_str(&signature).unwrap();
-                            let transaction = self
-                                .rpc
-                                .get_transaction_with_config(&s, config)
-                                .await?;
+                    let adjusted_slot = slot.saturating_sub(self.root_lag);
+                    match self.rpc.get_block_with_config(adjusted_slot, self.config).await {
+                        Ok(block) => {
+                            if let Some(signatures) = block.signatures {
+                                for signature in signatures.into_iter().take(self.tx_limit) {
+                                    match Signature::from_str(&signature) {
+                                        Ok(s) => match self.rpc.get_transaction_with_config(&s, config).await {
+                                            Ok(transaction) => {
+                                                let content = Transaction {
+                                                    signature,
+                                                    slot: adjusted_slot,
+                                                    block_hash: block.blockhash.clone(),
+                                                    timestamp: block.block_time.unwrap_or_default(),
+                                                    data: transaction,
+                                                };
 
-                            let content = Transaction {
-                                signature,
-                                slot,
-                                block_hash: block.blockhash.to_owned(),
-                                timestamp: block.block_time.unwrap(),
-                                data: transaction,
-                            };
-                            #[derive(Debug, Deserialize)]
-                            struct Id {
-                                #[allow(dead_code)]
-                                id: RecordId,
+                                                #[derive(Debug, Deserialize)]
+                                                struct Id {
+                                                    #[allow(dead_code)]
+                                                    id: RecordId,
+                                                }
+
+                                                match self.db.create::<Option<Id>>("transactions").content(content).await {
+                                                    Ok(id) => info!("Stored transaction: {:?}", id),
+                                                    Err(e) => error!("Failed to store transaction: {}", e),
+                                                }
+                                            }
+                                            Err(e) => error!("Failed to fetch transaction details: {}", e),
+                                        },
+                                        Err(e) => error!("Invalid signature format: {}", e),
+                                    }
+                                }
                             }
-                            let id: Option<Id> = self
-                                .db
-                                .create("transactions")
-                                .content(content)
-                                .await?;
-                            tracing::info!("{:?}", id);
                         }
+                        Err(e) => error!("Failed to fetch block data: {}", e),
                     }
                 },
-                Ok(_) = self.shutdown.recv() => break,
-                else => break,
+                Ok(_) = self.shutdown.recv() => {
+                    info!("Shutdown signal received.");
+                    break;
+                }
+                else => {
+                    error!("Unexpected error in fetch loop, shutting down.");
+                    break;
+                }
             }
         }
 
-        tracing::info!("fetcher shutting down...");
+        info!("Fetcher shutting down...");
         unsubscribe().await;
-
-        tracing::info!("fetcher shut down");
+        info!("Fetcher shut down.");
         Ok(())
     }
 }

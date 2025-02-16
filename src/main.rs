@@ -5,7 +5,7 @@ use fetcher::{TransactionFetcher, TransactionFetcherError};
 use surrealdb::{engine::remote::ws::Ws, opt::auth::Root, Surreal};
 use thiserror::Error;
 use tokio::{join, net::TcpListener, sync::broadcast};
-use tracing::Level;
+use tracing::{error, info, Level};
 use url::Url;
 
 pub mod fetcher;
@@ -38,10 +38,10 @@ struct Args {
     #[arg(long, env)]
     db_db: String,
 
-    #[arg(long, short = 'l', env)]
+    #[arg(long, short = 'l', env, default_value_t = 100)]
     root_lag: u64,
 
-    #[arg(long, short, env)]
+    #[arg(long, short, env, default_value_t = 1000)]
     tx_limit: usize,
 }
 
@@ -52,6 +52,9 @@ enum AppError {
 
     #[error(transparent)]
     TransactionFetcher(#[from] TransactionFetcherError),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 #[tokio::main]
@@ -60,14 +63,18 @@ async fn main() -> Result<(), AppError> {
 
     let args = Args::parse();
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let listener = TcpListener::bind(args.bind).await.unwrap();
-    let db = Surreal::new::<Ws>(args.db_addr).await?;
+
+    info!("Starting server on {}", args.bind);
+    let listener = TcpListener::bind(args.bind).await?;
+
+    info!("Connecting to database at {}", args.db_addr);
+    let db = Surreal::new::<Ws>(&args.db_addr).await?;
     db.signin(Root {
         username: &args.db_user,
         password: &args.db_pass,
     })
     .await?;
-    db.use_ns(args.db_ns).use_db(args.db_db).await?;
+    db.use_ns(&args.db_ns).use_db(&args.db_db).await?;
 
     let mut transaction_fetcher = TransactionFetcher::new(
         args.rpc_url,
@@ -79,15 +86,19 @@ async fn main() -> Result<(), AppError> {
     )
     .await?;
 
-    let transaction_fetcher_task = transaction_fetcher.run();
-    let server_task = server::run(listener, db, shutdown_tx.subscribe());
-    let shutdown_task = async {
-        shutdown::shutdown_signal().await;
-        shutdown_tx.send(()).unwrap();
-    };
+    info!("Starting tasks...");
+    let result = join!(
+        transaction_fetcher.run(),
+        server::run(listener, db, shutdown_tx.subscribe()),
+        async {
+            shutdown::shutdown_signal().await;
+            if let Err(e) = shutdown_tx.send(()) {
+                error!("Failed to send shutdown signal: {}", e);
+            }
+        }
+    );
 
-    let result = join!(transaction_fetcher_task, server_task, shutdown_task);
-    tracing::info!("{:?}", result);
+    info!("Shutdown complete: {:?}", result);
 
     Ok(())
 }
