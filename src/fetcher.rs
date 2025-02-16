@@ -41,7 +41,8 @@ pub struct Transaction {
 pub struct TransactionFetcher<C: Connection> {
     rpc: RpcClient,
     ws: PubsubClient,
-    config: RpcBlockConfig,
+    block_config: RpcBlockConfig,
+    transaction_config: RpcTransactionConfig,
     db: Surreal<C>,
     root_lag: u64,
     tx_limit: usize,
@@ -60,18 +61,24 @@ impl<C: Connection> TransactionFetcher<C> {
         let rpc =
             RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::finalized());
         let ws = PubsubClient::new(ws_url.as_str()).await?;
-        let config = RpcBlockConfig {
+        let block_config = RpcBlockConfig {
             encoding: Some(UiTransactionEncoding::JsonParsed),
             transaction_details: Some(TransactionDetails::Signatures),
             rewards: Some(true),
             commitment: None,
             max_supported_transaction_version: Some(0),
         };
+        let transaction_config = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::JsonParsed),
+            commitment: Some(CommitmentConfig::finalized()),
+            max_supported_transaction_version: Some(0),
+        };
 
         Ok(Self {
             rpc,
             ws,
-            config,
+            block_config,
+            transaction_config,
             db,
             root_lag,
             tx_limit,
@@ -81,17 +88,12 @@ impl<C: Connection> TransactionFetcher<C> {
 
     pub async fn run(&mut self) -> Result<(), TransactionFetcherError> {
         let (mut stream, unsubscribe) = self.ws.root_subscribe().await?;
-        let config = RpcTransactionConfig {
-            encoding: Some(UiTransactionEncoding::JsonParsed),
-            commitment: Some(CommitmentConfig::finalized()),
-            max_supported_transaction_version: Some(0),
-        };
 
         loop {
             select! {
                 Some(slot) = stream.next() => {
                     let adjusted_slot = slot.saturating_sub(self.root_lag);
-                    match self.rpc.get_block_with_config(adjusted_slot, self.config).await {
+                    match self.rpc.get_block_with_config(adjusted_slot, self.block_config).await {
                         Ok(block) => {
                             if let Some(signatures) = block.signatures {
                                 let mut fetch_futures = Vec::new();
@@ -99,13 +101,13 @@ impl<C: Connection> TransactionFetcher<C> {
                                 for signature in signatures.into_iter().take(self.tx_limit) {
                                     let rpc = &self.rpc;
                                     let db = &self.db;
-                                    let config = &config;
+                                    let transaction_config = self.transaction_config;
                                     let block_hash = block.blockhash.clone();
                                     let slot = adjusted_slot;
 
                                     fetch_futures.push(async move {
                                         match Signature::from_str(&signature) {
-                                            Ok(s) => match rpc.get_transaction_with_config(&s, config.clone()).await {
+                                            Ok(s) => match rpc.get_transaction_with_config(&s, transaction_config).await {
                                                 Ok(transaction) => {
                                                     let content = Transaction {
                                                         signature,
